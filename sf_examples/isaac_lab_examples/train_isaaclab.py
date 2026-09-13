@@ -97,6 +97,16 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
 
         from isaaclab.app import AppLauncher
 
+        # Kit sizes its tasking pool from os.cpu_count(), which reports the HOST
+        # core count; inside a CPU-quota'd container that oversubscribes the
+        # cgroup and the container spends its quota on context switches. Pass the
+        # cap through sys.argv, the same transport Isaac Lab uses for distributed
+        # runs (it strips the arg again once the app is up).
+        cpu_threads = os.environ.get("IL_CPU_THREADS")
+        if cpu_threads:
+            sys.argv.append(f"--/plugins/carb.tasking.plugin/threadCount={cpu_threads}")
+            print(f"[bridge] capping Kit tasking pool at {cpu_threads} threads", flush=True)
+
         AppLauncher({"headless": True, "device": torch_device, "enable_cameras": False})
 
     import isaaclab_tasks  # noqa: F401  (task registration)
