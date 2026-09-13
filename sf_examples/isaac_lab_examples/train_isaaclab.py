@@ -123,6 +123,24 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
     env_cfg.scene.num_envs = getattr(cfg, "il_num_envs", 512) if cfg is not None else 512
     env_cfg.seed = getattr(cfg, "seed", 0) if cfg is not None else 0
 
+    # Freeze the ADR curriculum at a fixed difficulty when asked. DifficultyScheduler
+    # clamps to [min_difficulty, max_difficulty], so pinning init=min=max removes both
+    # promotion and demotion and holds difficulty_frac constant, which fixes every
+    # interpolation term. Needed for hyperparameter comparison: the curriculum ramps on
+    # a policy-dependent schedule, so without this a *better* policy can score *lower*
+    # simply because it was promoted to a harder setting. Fails loudly on tasks with no
+    # ADR term rather than silently measuring the wrong thing.
+    adr_freeze = os.environ.get("IL_ADR_DIFFICULTY")
+    if adr_freeze is not None:
+        adr_term = getattr(getattr(env_cfg, "curriculum", None), "adr", None)
+        if adr_term is None or "init_difficulty" not in adr_term.params:
+            raise RuntimeError(
+                f"IL_ADR_DIFFICULTY={adr_freeze} was set but task {full_env_name!r} has no ADR curriculum term"
+            )
+        for key in ("init_difficulty", "min_difficulty", "max_difficulty"):
+            adr_term.params[key] = int(adr_freeze)
+        print(f"[bridge] ADR curriculum FROZEN at difficulty {adr_freeze}", flush=True)
+
     env = gym.make(full_env_name, cfg=env_cfg)
     obs_keys = tuple(getattr(cfg, "il_obs_groups", "policy").split(","))
     wrapped = IsaacLabVecEnv(env, obs_keys=obs_keys)
