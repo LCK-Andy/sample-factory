@@ -69,20 +69,32 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
     if key in _ENV_SINGLETON:
         print(f"[bridge] reusing cached env pid={os.getpid()}", flush=True)
         return _ENV_SINGLETON[key]
-    print(f"[bridge] make_isaaclab_env CALLED pid={os.getpid()}", flush=True)
+    physics = getattr(cfg, "il_physics", "newton_mjwarp") if cfg is not None else "newton_mjwarp"
+    print(f"[bridge] make_isaaclab_env CALLED pid={os.getpid()} physics={physics}", flush=True)
+
+    sf_device = getattr(cfg, "device", "gpu") if cfg is not None else "gpu"
+    torch_device = "cuda:0" if "gpu" in sf_device else "cpu"
+
+    if physics == "physx":
+        # app-first boot: PhysX needs the full Isaac Sim app running BEFORE any
+        # task-package import that touches pxr (dual-USD crash otherwise)
+        import isaacsim  # noqa: F401
+
+        from isaaclab.app import AppLauncher
+
+        AppLauncher({"headless": True, "device": torch_device, "enable_cameras": False})
+
     import isaaclab_tasks  # noqa: F401  (task registration)
     from isaaclab_tasks.utils.hydra import resolve_task_config
 
     _argv = sys.argv
-    sys.argv = [_argv[0], "presets=newton_mjwarp"]
+    sys.argv = [_argv[0], f"presets={physics}"]
     try:
         env_cfg, _agent_cfg = resolve_task_config(full_env_name, "rsl_rl_cfg_entry_point")
     finally:
         sys.argv = _argv
 
-    # SF names devices "gpu"/"cpu"; Isaac Lab wants "cuda:0"/"cpu"
-    sf_device = getattr(cfg, "device", "gpu") if cfg is not None else "gpu"
-    env_cfg.sim.device = "cuda:0" if "gpu" in sf_device else "cpu"
+    env_cfg.sim.device = torch_device
     env_cfg.scene.num_envs = getattr(cfg, "il_num_envs", 512) if cfg is not None else 512
     env_cfg.seed = getattr(cfg, "seed", 0) if cfg is not None else 0
 
@@ -94,6 +106,13 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
 
 def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
     p = parser
+    p.add_argument(
+        "--il_physics",
+        default="newton_mjwarp",
+        type=str,
+        choices=["newton_mjwarp", "physx"],
+        help="Isaac Lab physics preset: newton_mjwarp (kit-less) or physx (full Isaac Sim, headless)",
+    )
     p.add_argument(
         "--il_num_envs",
         default=512,
