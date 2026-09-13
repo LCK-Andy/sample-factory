@@ -56,7 +56,9 @@ setup(
     install_requires=[
         "numpy>=1.18.1,<2.0",
         "torch>=1.9,<3.0,!=1.13.0",
-        "gymnasium>=0.27,<1.0",
+        # lifted <1.0 for Isaac Lab 3.0 coexistence (requires gymnasium>=1.1.1);
+        # SF's own usage of the gymnasium API is compatible with 1.x
+        "gymnasium>=0.27,<2.0",
         "pyglet",  # gym dependency
         "tensorboard>=1.15.0",
         "tensorboardx>=2.0",

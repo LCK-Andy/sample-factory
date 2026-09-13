@@ -100,7 +100,8 @@ def spawn_tmp_env_and_get_info(sf_context, res_queue, cfg):
     tmp_env.close()
     del tmp_env
 
-    log.debug("Env info: %r", env_info)
+    import logging as _l
+    _l.getLogger(__name__).info("ENV_INFO: %r", env_info)
     res_queue.put(env_info)
 
 

@@ -131,6 +131,15 @@ class NonBatchedDictObservationsWrapper(_DictObservationsWrapper):
 
 
 class BatchedListToDictWrapper(Wrapper):
+    def __init__(self, env):
+        # propagate agent counts: get_multiagent_info on the WRAPPED env, otherwise
+        # BatchedVecEnv.num_agents collapses to 1 for GPU-vectorized envs that
+        # report (is_multiagent=True, num_agents=N) -- the batch dim IS the agents
+        is_multiagent, num_agents = get_multiagent_info(env)
+        self.is_multiagent: bool = is_multiagent
+        self.num_agents: int = num_agents
+        super().__init__(env)
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         if isinstance(obs, list):
