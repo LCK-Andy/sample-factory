@@ -106,6 +106,21 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
 
 def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
     p = parser
+    # set_defaults BEFORE parse_full_cfg: values become true argparse defaults
+    # and reach every component (post-parse cfg mutation does NOT propagate to
+    # BufferMgr/sampler -- both num_workers pinning and rollout/batch sizing
+    # were silently lost that way). batched mode: one SF env = the whole
+    # GPU-vectorized sim, so exactly one env instance per worker; and SF
+    # requires batch_size/rollout trajectories (4096/32=128) to divide
+    # num_agents (512).
+    p.set_defaults(
+        num_workers=1,
+        num_envs_per_worker=1,
+        worker_num_splits=1,
+        rollout=32,
+        batch_size=4096,
+        num_batches_per_epoch=2,
+    )
     p.add_argument(
         "--il_physics",
         default="newton_mjwarp",
@@ -122,25 +137,12 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
 
 
 def custom_env_override_defaults(cfg) -> None:
-    """Sane SF defaults for Isaac Lab vectorized sims."""
-    # batched mode: the single SF "env" IS the whole GPU-vectorized sim.
-    # SF's defaults (num_workers=cpu_count, num_envs_per_worker=8) would create
-    # dozens of Isaac Lab sims; Isaac Lab allows ONE sim context per process.
-    cfg.num_workers = 1
-    cfg.num_envs_per_worker = 1
-    cfg.worker_num_splits = 1
-    if cfg.env == "Isaac-Ant-Direct-v0":
-        # rollout length and batch sizing suitable for a 512-env GPU sim
-        cfg.rollout = 24
-        cfg.batch_size = 4096
-        cfg.num_batches_per_epoch = 2
-        cfg.encoder_mlp_layers = [400, 200, 100]  # match the rsl-rl baseline sizing
-        cfg.hidden_mlp_layers = [256, 128]
-        cfg.learning_rate = 3e-4
-        cfg.adam_eps = 1e-5
-    else:
-        cfg.rollout = 32
-        cfg.batch_size = 8192
+    """Network/hyperparameter shaping (structural pins live in
+    add_extra_params_func via parser.set_defaults -- see the note there)."""
+    cfg.encoder_mlp_layers = [400, 200, 100]  # match the rsl-rl baseline sizing
+    cfg.hidden_mlp_layers = [256, 128]
+    cfg.learning_rate = 3e-4
+    cfg.adam_eps = 1e-5
 
 
 def register_isaaclab_envs() -> None:
