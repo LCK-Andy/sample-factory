@@ -16,6 +16,7 @@ import sys
 from typing import Dict, Optional, Tuple
 
 import gymnasium as gym
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -28,18 +29,32 @@ _ENV_SINGLETON: dict = {}
 
 
 class IsaacLabVecEnv(gym.Env):
-    """Adapts an Isaac Lab DirectRLEnv to SF's batched-env contract."""
+    """Adapts an Isaac Lab vectorized env (DirectRLEnv or ManagerBasedRLEnv) to SF's batched-env contract."""
 
-    def __init__(self, env):
+    def __init__(self, env, obs_keys=("policy",)):
         self.env = env
         raw = env.unwrapped  # gymnasium OrderEnforcing wrapper hides Isaac Lab attrs
         self._device = raw.device
         self.num_agents = raw.num_envs
         self.action_space = convert_space(raw.single_action_space)
-        self.observation_space = gym.spaces.Dict(dict(obs=convert_space(raw.single_observation_space["policy"])))
+        self._obs_keys = tuple(obs_keys)
+        group_spaces = [convert_space(raw.single_observation_space[k]) for k in self._obs_keys]
+        if len(group_spaces) == 1:
+            obs_space = group_spaces[0]
+        else:
+            # manager-based tasks expose several obs groups (each flat, since the
+            # task sets concatenate_terms=True); the agent consumes their concat
+            low = np.concatenate([s.low for s in group_spaces])
+            high = np.concatenate([s.high for s in group_spaces])
+            obs_space = gym.spaces.Box(low, high, dtype=group_spaces[0].dtype)
+        self.observation_space = gym.spaces.Dict(dict(obs=obs_space))
 
     def _obs(self, obs_dict) -> Dict[str, Tensor]:
-        return {"obs": obs_dict["policy"]}
+        if len(self._obs_keys) == 1:
+            x = obs_dict[self._obs_keys[0]]
+        else:
+            x = torch.cat([obs_dict[k] for k in self._obs_keys], dim=-1)
+        return {"obs": x}
 
     def reset(self, *args, **kwargs) -> Tuple[Dict[str, Tensor], Dict]:
         obs_dict, infos = self.env.reset()
@@ -99,7 +114,8 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
     env_cfg.seed = getattr(cfg, "seed", 0) if cfg is not None else 0
 
     env = gym.make(full_env_name, cfg=env_cfg)
-    wrapped = IsaacLabVecEnv(env)
+    obs_keys = tuple(getattr(cfg, "il_obs_groups", "policy").split(","))
+    wrapped = IsaacLabVecEnv(env, obs_keys=obs_keys)
     _ENV_SINGLETON[key] = wrapped
     return wrapped
 
@@ -134,19 +150,39 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
         type=int,
         help="Number of parallel Isaac Lab envs inside the single batched env",
     )
+    p.add_argument(
+        "--il_obs_groups",
+        default="policy",
+        type=str,
+        help="Comma-separated Isaac Lab obs groups concatenated into the agent obs "
+        "(manager-based tasks, e.g. policy,proprio,perception for dexsuite)",
+    )
 
 
 def custom_env_override_defaults(cfg) -> None:
     """Network/hyperparameter shaping (structural pins live in
-    add_extra_params_func via parser.set_defaults -- see the note there)."""
-    cfg.encoder_mlp_layers = [400, 200, 100]  # match the rsl-rl baseline sizing
+    add_extra_params_func via parser.set_defaults -- see the note there).
+
+    NOTE: runs AFTER CLI parsing, so anything set here trumps command-line flags.
+    Only Ant-specific hyperparameters are pinned for the Ant env; dexsuite keeps
+    CLI values so the recipe can be tuned per run."""
     cfg.hidden_mlp_layers = [256, 128]
-    cfg.learning_rate = 3e-4
-    cfg.adam_eps = 1e-5
+    if "Dexsuite" in cfg.env:
+        # match the task's rsl_rl cfg sizing ([512, 256, 128], elu)
+        cfg.encoder_mlp_layers = [512, 256, 128]
+    else:
+        cfg.encoder_mlp_layers = [400, 200, 100]  # match the rsl-rl baseline sizing
+        cfg.learning_rate = 3e-4
+        cfg.adam_eps = 1e-5
 
 
 def register_isaaclab_envs() -> None:
     register_env("Isaac-Ant-Direct-v0", make_isaaclab_env)
+    for env_id in (
+        "Isaac-Dexsuite-Kuka-Allegro-Lift-v0",
+        "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0",
+    ):
+        register_env(env_id, make_isaaclab_env)
 
 
 def parse_args(argv=None, evaluation=False):
