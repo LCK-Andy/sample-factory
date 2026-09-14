@@ -107,7 +107,15 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
             sys.argv.append(f"--/plugins/carb.tasking.plugin/threadCount={cpu_threads}")
             print(f"[bridge] capping Kit tasking pool at {cpu_threads} threads", flush=True)
 
-        AppLauncher({"headless": True, "device": torch_device, "enable_cameras": False})
+        # GUI playback: default is headless; IL_RENDER=1 boots the full Kit
+        # visualizer so the env's own rendering draws the scene while it steps
+        # (same AppLauncher posture as the flash_rl play path).
+        headless = os.environ.get("IL_RENDER", "") != "1"
+        kit_args = {"headless": headless, "device": torch_device, "enable_cameras": False}
+        if not headless:
+            kit_args["visualizer"] = ["kit"]
+            kit_args["visualizer_explicit"] = True
+        AppLauncher(kit_args)
 
     import isaaclab_tasks  # noqa: F401  (task registration)
     from isaaclab_tasks.utils.hydra import resolve_task_config
