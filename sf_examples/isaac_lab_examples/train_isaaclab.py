@@ -193,6 +193,19 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
         help="Comma-separated Isaac Lab obs groups concatenated into the agent obs "
         "(manager-based tasks, e.g. policy,proprio,perception for dexsuite)",
     )
+    p.add_argument(
+        "--il_model",
+        default="default",
+        type=str,
+        choices=["default", "flashsac"],
+        help="Model architecture: default (SF MLP+optional GRU) or flashsac "
+        "(FlashSAC residual-block actor + ensemble 101-bin categorical critic)",
+    )
+    if "--il_model=flashsac" in sys.argv:
+        # FlashSAC is feed-forward: rnn buffers are allocated from cfg.use_rnn at
+        # BufferMgr construction, so this pin must be a parser default (post-parse
+        # mutation never reaches the buffer structure -- see the note above).
+        p.set_defaults(use_rnn=False)
 
 
 def custom_env_override_defaults(cfg) -> None:
@@ -202,6 +215,12 @@ def custom_env_override_defaults(cfg) -> None:
     NOTE: runs AFTER CLI parsing, so anything set here trumps command-line flags.
     Only Ant-specific hyperparameters are pinned for the Ant env; dexsuite keeps
     CLI values so the recipe can be tuned per run."""
+    if getattr(cfg, "il_model", "default") == "flashsac":
+        from sf_examples.isaac_lab_examples.flashsac_model import register_flashsac_model
+
+        register_flashsac_model()
+        return  # FlashSAC model ignores the SF encoder/decoder sizing knobs
+
     cfg.hidden_mlp_layers = [256, 128]
     if "Dexsuite" in cfg.env:
         # match the task's rsl_rl cfg sizing ([512, 256, 128], elu)
