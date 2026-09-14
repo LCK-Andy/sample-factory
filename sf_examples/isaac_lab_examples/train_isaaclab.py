@@ -31,7 +31,7 @@ _ENV_SINGLETON: dict = {}
 class IsaacLabVecEnv(gym.Env):
     """Adapts an Isaac Lab vectorized env (DirectRLEnv or ManagerBasedRLEnv) to SF's batched-env contract."""
 
-    def __init__(self, env, obs_keys=("policy",)):
+    def __init__(self, env, obs_keys=("policy",), framestack: int = 1):
         self.env = env
         raw = env.unwrapped  # gymnasium OrderEnforcing wrapper hides Isaac Lab attrs
         self._device = raw.device
@@ -47,13 +47,35 @@ class IsaacLabVecEnv(gym.Env):
             low = np.concatenate([s.low for s in group_spaces])
             high = np.concatenate([s.high for s in group_spaces])
             obs_space = gym.spaces.Box(low, high, dtype=group_spaces[0].dtype)
+        self.framestack = max(1, framestack)
+        if self.framestack > 1:
+            # sliding-window history (see _obs); the agent sees the K frames concat'd
+            low = np.concatenate([obs_space.low] * self.framestack)
+            high = np.concatenate([obs_space.high] * self.framestack)
+            obs_space = gym.spaces.Box(low, high, dtype=obs_space.dtype)
         self.observation_space = gym.spaces.Dict(dict(obs=obs_space))
+        self._hist: Optional[torch.Tensor] = None  # [N, K, D] on the sim device
 
-    def _obs(self, obs_dict) -> Dict[str, Tensor]:
+    def _obs(self, obs_dict, done: Optional[torch.Tensor] = None) -> Dict[str, Tensor]:
         if len(self._obs_keys) == 1:
             x = obs_dict[self._obs_keys[0]]
         else:
             x = torch.cat([obs_dict[k] for k in self._obs_keys], dim=-1)
+        if self.framestack > 1:
+            # Sliding window on the GPU, oldest -> newest along dim 1. DirectRLEnv
+            # resets done envs BEFORE computing the step's obs, so an obs that
+            # arrives with done=True is the new episode's FIRST frame: re-fill that
+            # row's whole window with it (repeat-fill -- standard frame-stack
+            # treatment, no padded tokens for attention to trip over).
+            if self._hist is None:
+                self._hist = x.unsqueeze(1).repeat(1, self.framestack, 1)
+            else:
+                self._hist = torch.cat([self._hist[:, 1:], x.unsqueeze(1)], dim=1)
+                if done is not None:
+                    done_rows = done.to(device=x.device, dtype=torch.bool).reshape(-1)
+                    if done_rows.any():
+                        self._hist[done_rows] = x[done_rows].unsqueeze(1)
+            x = self._hist.reshape(self.num_agents, -1)
         return {"obs": x}
 
     def reset(self, *args, **kwargs) -> Tuple[Dict[str, Tensor], Dict]:
@@ -64,7 +86,8 @@ class IsaacLabVecEnv(gym.Env):
         if not torch.is_tensor(actions):  # SF hands over numpy unless --env_gpu_actions
             actions = torch.as_tensor(actions, dtype=torch.float32, device=self._device)
         obs_dict, rew, terminated, truncated, infos = self.env.step(actions)
-        return self._obs(obs_dict), rew, terminated, truncated, {}
+        done = torch.logical_or(terminated, truncated)
+        return self._obs(obs_dict, done), rew, terminated, truncated, {}
 
     def render(self):
         pass
@@ -151,7 +174,10 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
 
     env = gym.make(full_env_name, cfg=env_cfg)
     obs_keys = tuple(getattr(cfg, "il_obs_groups", "policy").split(","))
-    wrapped = IsaacLabVecEnv(env, obs_keys=obs_keys)
+    framestack = getattr(cfg, "il_framestack", 0) if cfg is not None else 0
+    if framestack <= 0:  # auto: temporal models get a history window, everyone else none
+        framestack = 8 if getattr(cfg, "il_model", "default") == "transformer" else 1
+    wrapped = IsaacLabVecEnv(env, obs_keys=obs_keys, framestack=framestack)
     _ENV_SINGLETON[key] = wrapped
     return wrapped
 
@@ -197,11 +223,26 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
         "--il_model",
         default="default",
         type=str,
-        choices=["default", "flashsac", "flashsac_shared"],
+        choices=["default", "flashsac", "flashsac_shared", "transformer"],
         help="Model architecture: default (SF MLP + optional GRU); flashsac (FlashSAC's "
         "separate actor/critic residual-block nets, GRU on the actor path); flashsac_shared "
         "(the combination: APPO's shared-trunk + GRU topology built from FlashSAC's "
-        "residual blocks, RMSNorm, ensemble 101-bin categorical value heads)",
+        "residual blocks, RMSNorm, ensemble 101-bin categorical value heads); transformer "
+        "(causal pre-LN transformer over the il_framestack window, stateless -- pair with "
+        "--use_rnn=False)",
+    )
+    p.add_argument(
+        "--il_framestack",
+        default=0,
+        type=int,
+        help="Sliding-window obs history K maintained on the GPU inside the bridge (obs dim "
+        "becomes K x obs_dim, oldest first). 0 = auto: 8 for il_model=transformer, 1 (off) "
+        "otherwise. Rows reset by repeat-fill at episode boundaries",
+    )
+    p.add_argument("--il_tr_d_model", default=256, type=int, help="transformer trunk width")
+    p.add_argument("--il_tr_layers", default=2, type=int, help="transformer encoder layers")
+    p.add_argument(
+        "--il_tr_heads", default=4, type=int, help="transformer attention heads (must divide il_tr_d_model)"
     )
 
 
@@ -218,6 +259,15 @@ def custom_env_override_defaults(cfg) -> None:
         register_flashsac_model(shared=cfg.il_model == "flashsac_shared")
         return  # FlashSAC-based models ignore the SF encoder/decoder sizing knobs
 
+    if getattr(cfg, "il_model", "default") == "transformer":
+        from sf_examples.isaac_lab_examples.transformer_model import register_transformer_model
+
+        register_transformer_model()
+        # NOTE: --use_rnn=False must come from the CLI -- a post-parse flip here
+        # never reaches BufferMgr/sampler, and the stateless core rejects
+        # PackedSequence input with a readable error instead of crashing opaquely.
+        return
+
     cfg.hidden_mlp_layers = [256, 128]
     if "Dexsuite" in cfg.env:
         # match the task's rsl_rl cfg sizing ([512, 256, 128], elu)
@@ -230,6 +280,7 @@ def custom_env_override_defaults(cfg) -> None:
 
 def register_isaaclab_envs() -> None:
     register_env("Isaac-Ant-Direct-v0", make_isaaclab_env)
+    register_env("Isaac-Repose-Cube-Allegro-Direct-v0", make_isaaclab_env)
     for env_id in (
         "Isaac-Dexsuite-Kuka-Allegro-Lift-v0",
         "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0",
