@@ -40,6 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.utils.rnn import PackedSequence
 
 from sample_factory.algo.utils.action_distributions import get_action_distribution
 from sample_factory.algo.utils.tensor_dict import TensorDict
@@ -166,7 +167,11 @@ class CategoricalValueHead(nn.Module):
 
 
 class FlashSACActorCritic(ActorCritic):
-    """FlashSAC actor + ensemble categorical critic behind SF's ActorCritic interface."""
+    """FlashSAC actor + ensemble categorical critic behind SF's ActorCritic interface.
+
+    Separate actor and critic networks (FlashSAC's own topology); GRU core on the
+    actor path only (SF's recurrent posture -- see the note in __init__).
+    """
 
     def __init__(self, obs_space: ObsSpace, action_space: ActionSpace, cfg: Config):
         super().__init__(obs_space, action_space, cfg)
@@ -178,12 +183,20 @@ class FlashSACActorCritic(ActorCritic):
         action_dim = action_space.shape[0]
 
         self.actor_trunk = FlashSACTrunk(obs_dim, ACTOR_HIDDEN)
-        self.policy_head = NormalPolicyHead(ACTOR_HIDDEN, action_dim)
+        # Recurrent memory on the actor path (SF's GRU core posture): the trunks are
+        # FlashSAC's, but this task's tactile inference needs history beyond the obs's
+        # built-in 5-step window -- the screen measured rnn-off at -2.22 vs +0.13 baseline.
+        # The critic stays feed-forward (value estimation from the obs history suffices),
+        # which also keeps SF's single-rnn-state-per-agent contract intact.
+        self.rnn_size = cfg.rnn_size
+        self.actor_gru = nn.GRU(ACTOR_HIDDEN, self.rnn_size, cfg.rnn_num_layers)
+        self.policy_head = NormalPolicyHead(self.rnn_size, action_dim)
 
         self.critic_trunks = nn.ModuleList([FlashSACTrunk(obs_dim, CRITIC_HIDDEN) for _ in range(NUM_QS)])
         self.value_heads = nn.ModuleList([CategoricalValueHead(CRITIC_HIDDEN, NUM_BINS, -VMAX, VMAX) for _ in range(NUM_QS)])
 
-        self._actor_slice = ACTOR_HIDDEN  # head-output layout: [actor | critic0 | critic1]
+        # head-output layout: [gru output | critic0 | critic1]
+        self._actor_slice = self.rnn_size
 
     def _values(self, x: Tensor) -> Tensor:
         member_values = torch.stack([head(trunk(x)) for trunk, head in zip(self.critic_trunks, self.value_heads)])
@@ -204,8 +217,29 @@ class FlashSACActorCritic(ActorCritic):
     def forward_head(self, normalized_obs_dict: Dict[str, Tensor]) -> Tensor:
         return self._head(normalized_obs_dict["obs"])
 
-    def forward_core(self, head_output: Tensor, rnn_states: Tensor):
-        return head_output, rnn_states  # feed-forward: identity
+    def forward_core(self, head_output, rnn_states):
+        """GRU over the actor slice; critic features pass through unchanged.
+
+        Handles both plain [B, D] tensors (rollout inference) and PackedSequences
+        (learner BPTT). build_rnn_inputs returns rnn_states already ordered to
+        match the packed sequences (indexed by rollout starts) -- the same
+        contract SF's own ModelCoreRNN relies on.
+        """
+        is_seq = not torch.is_tensor(head_output)
+        h0 = rnn_states.unsqueeze(0).contiguous()
+
+        if is_seq:
+            data, batch_sizes, sorted_indices, unsorted_indices = head_output
+            actor_feat = PackedSequence(data[:, :ACTOR_HIDDEN], batch_sizes, sorted_indices, unsorted_indices)
+            critic_feat = data[:, ACTOR_HIDDEN:]
+            gru_out, new_states = self.actor_gru(actor_feat, h0)
+            out_data = torch.cat([gru_out.data, critic_feat], dim=1)
+            return PackedSequence(out_data, batch_sizes, sorted_indices, unsorted_indices), new_states.squeeze(0)
+
+        actor_feat = head_output[:, :ACTOR_HIDDEN]
+        critic_feat = head_output[:, ACTOR_HIDDEN:]
+        gru_out, new_states = self.actor_gru(actor_feat.unsqueeze(0), h0)
+        return torch.cat([gru_out.squeeze(0), critic_feat], dim=1), new_states.squeeze(0)
 
     def forward_tail(
         self,
@@ -254,12 +288,127 @@ def make_flashsac_actor_critic(cfg: Config, obs_space: ObsSpace, action_space: A
     return FlashSACActorCritic(obs_space, action_space, cfg)
 
 
-def register_flashsac_model() -> None:
+def run_gru(gru: nn.GRU, x, rnn_states: Tensor):
+    """GRU over a plain [B, D] tensor or a PackedSequence (learner BPTT).
+
+    build_rnn_inputs returns rnn_states already ordered to match the packed
+    sequences (indexed by rollout starts) -- the same contract SF's own
+    ModelCoreRNN relies on.
+    """
+    h0 = rnn_states.unsqueeze(0).contiguous()
+    if torch.is_tensor(x):
+        x = x.unsqueeze(0)
+        out, new_states = gru(x, h0)
+        return out.squeeze(0), new_states.squeeze(0)
+    out, new_states = gru(x, h0)
+    return out, new_states.squeeze(0)
+
+
+# ---- the COMBINED architecture: APPO topology, FlashSAC vocabulary ----
+SHARED_HIDDEN = 256  # trunk width; the GRU still widens to cfg.rnn_size (512)
+
+
+class FlashSACSharedActorCritic(ActorCritic):
+    """FlashSAC components arranged in SF-APPO's topology.
+
+    APPO contributes the SHAPE (one shared trunk for actor and critic, a GRU core
+    between trunk and heads, obs/returns normalizers -- the same topology as the
+    model that trained the 1B dexlift policy). FlashSAC contributes the PARTS:
+    UnitLinear embedder, residual blocks with expansion 4, RMSNorm, a
+    state-dependent tanh-normalized log-std policy head, and an ensemble of
+    101-bin categorical value heads (min over 2 members). The ensemble here is
+    head-level on the shared features rather than network-level, since the
+    trunk is shared.
+    """
+
+    def __init__(self, obs_space: ObsSpace, action_space: ActionSpace, cfg: Config):
+        super().__init__(obs_space, action_space, cfg)
+
+        if isinstance(obs_space, gym.spaces.Dict):
+            assert list(obs_space.spaces.keys()) == ["obs"], f"unexpected obs keys {obs_space.spaces}"
+            obs_space = obs_space["obs"]
+        obs_dim = obs_space.shape[0]
+        action_dim = action_space.shape[0]
+
+        self.shared_trunk = FlashSACTrunk(obs_dim, SHARED_HIDDEN)
+        self.rnn_size = cfg.rnn_size
+        self.core_gru = nn.GRU(SHARED_HIDDEN, self.rnn_size, cfg.rnn_num_layers)
+        self.policy_head = NormalPolicyHead(self.rnn_size, action_dim)
+        self.value_heads = nn.ModuleList(
+            [CategoricalValueHead(self.rnn_size, NUM_BINS, -VMAX, VMAX) for _ in range(NUM_QS)]
+        )
+
+    def forward_head(self, normalized_obs_dict: Dict[str, Tensor]) -> Tensor:
+        return self.shared_trunk(normalized_obs_dict["obs"])
+
+    def forward_core(self, head_output, rnn_states):
+        return run_gru(self.core_gru, head_output, rnn_states)
+
+    def _tail_values(self, core_output: Tensor) -> Tensor:
+        member_values = torch.stack([head(core_output) for head in self.value_heads])
+        return member_values.min(dim=0).values
+
+    def forward_tail(
+        self,
+        core_output: Tensor,
+        values_only: bool = False,
+        sample_actions: bool = True,
+        action_mask: Optional[Tensor] = None,
+    ) -> TensorDict:
+        if values_only:
+            return TensorDict(values=self._tail_values(core_output))
+
+        action_logits = self.policy_head(core_output)
+        self.last_action_distribution = get_action_distribution(self.action_space, raw_logits=action_logits)
+
+        result = TensorDict()
+        result["values"] = self._tail_values(core_output)
+        result["action_logits"] = action_logits
+        self._maybe_sample_actions(sample_actions, result)
+        return result
+
+    def forward(
+        self,
+        normalized_obs_dict: Dict[str, Tensor],
+        rnn_states: Tensor,
+        values_only: bool = False,
+        sample_actions: bool = True,
+        action_mask: Optional[Tensor] = None,
+    ) -> TensorDict:
+        head_output = self.forward_head(normalized_obs_dict)
+        core_output, new_rnn_states = self.forward_core(head_output, rnn_states)
+        result = self.forward_tail(core_output, values_only=values_only, sample_actions=sample_actions, action_mask=action_mask)
+        result["new_rnn_states"] = new_rnn_states
+        return result
+
+    # the base class introspects encoders[0] for these; this model has no SF encoders
+    def device_for_input_tensor(self, input_tensor_name: str) -> torch.device:
+        from sample_factory.model.model_utils import model_device
+
+        return model_device(self)
+
+    def type_for_input_tensor(self, input_tensor_name: str) -> torch.dtype:
+        return torch.float32
+
+
+def make_flashsac_shared_actor_critic(cfg: Config, obs_space: ObsSpace, action_space: ActionSpace) -> ActorCritic:
+    return FlashSACSharedActorCritic(obs_space, action_space, cfg)
+
+
+def register_flashsac_model(shared: bool = False) -> None:
     from sample_factory.algo.utils.context import global_model_factory
 
-    global_model_factory().register_actor_critic_factory(make_flashsac_actor_critic)
-    print(
-        f"[flashsac-model] registered: actor {NUM_BLOCKS}x{ACTOR_HIDDEN} (exp {EXPANSION}), "
-        f"critic {NUM_QS}x({NUM_BLOCKS}x{CRITIC_HIDDEN}, {NUM_BINS} bins, +-{VMAX})",
-        flush=True,
-    )
+    if shared:
+        global_model_factory().register_actor_critic_factory(make_flashsac_shared_actor_critic)
+        print(
+            f"[flashsac-model] registered SHARED variant (APPO topology): trunk {NUM_BLOCKS}x{SHARED_HIDDEN} "
+            f"(exp {EXPANSION}) -> GRU -> cfg.rnn_size -> policy head + {NUM_QS}x {NUM_BINS}-bin value heads (+-{VMAX})",
+            flush=True,
+        )
+    else:
+        global_model_factory().register_actor_critic_factory(make_flashsac_actor_critic)
+        print(
+            f"[flashsac-model] registered (separate nets): actor {NUM_BLOCKS}x{ACTOR_HIDDEN} (exp {EXPANSION}) "
+            f"+ GRU -> policy head, critic {NUM_QS}x({NUM_BLOCKS}x{CRITIC_HIDDEN}, {NUM_BINS} bins, +-{VMAX})",
+            flush=True,
+        )

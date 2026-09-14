@@ -197,15 +197,12 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
         "--il_model",
         default="default",
         type=str,
-        choices=["default", "flashsac"],
-        help="Model architecture: default (SF MLP+optional GRU) or flashsac "
-        "(FlashSAC residual-block actor + ensemble 101-bin categorical critic)",
+        choices=["default", "flashsac", "flashsac_shared"],
+        help="Model architecture: default (SF MLP + optional GRU); flashsac (FlashSAC's "
+        "separate actor/critic residual-block nets, GRU on the actor path); flashsac_shared "
+        "(the combination: APPO's shared-trunk + GRU topology built from FlashSAC's "
+        "residual blocks, RMSNorm, ensemble 101-bin categorical value heads)",
     )
-    if "--il_model=flashsac" in sys.argv:
-        # FlashSAC is feed-forward: rnn buffers are allocated from cfg.use_rnn at
-        # BufferMgr construction, so this pin must be a parser default (post-parse
-        # mutation never reaches the buffer structure -- see the note above).
-        p.set_defaults(use_rnn=False)
 
 
 def custom_env_override_defaults(cfg) -> None:
@@ -215,11 +212,11 @@ def custom_env_override_defaults(cfg) -> None:
     NOTE: runs AFTER CLI parsing, so anything set here trumps command-line flags.
     Only Ant-specific hyperparameters are pinned for the Ant env; dexsuite keeps
     CLI values so the recipe can be tuned per run."""
-    if getattr(cfg, "il_model", "default") == "flashsac":
+    if getattr(cfg, "il_model", "default") in ("flashsac", "flashsac_shared"):
         from sf_examples.isaac_lab_examples.flashsac_model import register_flashsac_model
 
-        register_flashsac_model()
-        return  # FlashSAC model ignores the SF encoder/decoder sizing knobs
+        register_flashsac_model(shared=cfg.il_model == "flashsac_shared")
+        return  # FlashSAC-based models ignore the SF encoder/decoder sizing knobs
 
     cfg.hidden_mlp_layers = [256, 128]
     if "Dexsuite" in cfg.env:
