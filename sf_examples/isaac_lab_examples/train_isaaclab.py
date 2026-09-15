@@ -263,9 +263,9 @@ def custom_env_override_defaults(cfg) -> None:
         from sf_examples.isaac_lab_examples.transformer_model import register_transformer_model
 
         register_transformer_model()
-        # NOTE: --use_rnn=False must come from the CLI -- a post-parse flip here
-        # never reaches BufferMgr/sampler, and the stateless core rejects
-        # PackedSequence input with a readable error instead of crashing opaquely.
+        # The stateless core rejects PackedSequence input with a readable error, but
+        # the saved config of a transformer experiment already carries use_rnn=False;
+        # a CLI --use_rnn=False also works for fresh launches.
         return
 
     cfg.hidden_mlp_layers = [256, 128]
@@ -292,6 +292,14 @@ def parse_args(argv=None, evaluation=False):
     parser, cfg = parse_sf_args(argv=argv, evaluation=evaluation)
     add_extra_params_func(parser)
     cfg = parse_full_cfg(parser, argv=argv)
+    # SF loads train_dir/<exp>/config.json only LATER (inside run_rl/enjoy), but the
+    # custom-model registration below must see the SAVED --il_model now (playback and
+    # re-runs of a custom-arch experiment would otherwise build the default model and
+    # crash on the checkpoint's state_dict). Loading here is idempotent and CLI values
+    # keep precedence over the saved config.
+    from sample_factory.cfg.arguments import maybe_load_from_checkpoint
+
+    cfg = maybe_load_from_checkpoint(cfg)
     custom_env_override_defaults(cfg)  # pins num_workers/num_envs_per_worker=1 etc.
     return cfg
 
