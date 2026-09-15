@@ -275,7 +275,11 @@ def maybe_load_from_checkpoint(cfg: Config) -> AttrDict:
     if not os.path.isfile(filename):
         log.warning("Saved parameter configuration for experiment %s not found!", cfg.experiment)
         log.warning("Starting experiment from scratch!")
-        return AttrDict(vars(cfg))
+        # NOTE: vars() on an AttrDict returns its (empty) instance __dict__ -- a second
+        # maybe_load_from_checkpoint on an already-loaded AttrDict (make_runner calls
+        # this again when restart_behavior=resume) would otherwise return an EMPTY
+        # AttrDict and crash on the first cfg attribute access.
+        return AttrDict(cfg.items() if isinstance(cfg, dict) else vars(cfg))
 
     return load_from_checkpoint(cfg)
 
