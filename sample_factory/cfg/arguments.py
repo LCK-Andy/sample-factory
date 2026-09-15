@@ -252,7 +252,12 @@ def load_from_checkpoint(cfg: Config) -> AttrDict:
             loaded_cfg[key] = value
 
     # incorporate extra CLI parameters that were not present in JSON file
-    for key, value in vars(cfg).items():
+    # NOTE: vars() on an AttrDict returns its (empty) instance __dict__, not the
+    # dict items -- a second load_from_checkpoint on an already-loaded AttrDict
+    # (e.g. enjoy() reloading after a caller already loaded) would otherwise drop
+    # every non-JSON key like eval_env_frameskip and crash later.
+    cfg_items = cfg.items() if isinstance(cfg, dict) else vars(cfg).items()
+    for key, value in cfg_items:
         if key not in loaded_cfg:
             log.debug("Adding new argument %r=%r that is not in the saved config file!", key, value)
             loaded_cfg[key] = value
