@@ -101,9 +101,8 @@ def load_state_dict(cfg: Config, actor_critic: ActorCritic, device: torch.device
 
 
 def enjoy(cfg: Config) -> Tuple[StatusCode, float]:
-    verbose = False
-
     cfg = load_from_checkpoint(cfg)
+    verbose = cfg.verbose
 
     eval_env_frameskip: int = cfg.env_frameskip if cfg.eval_env_frameskip is None else cfg.eval_env_frameskip
     assert (

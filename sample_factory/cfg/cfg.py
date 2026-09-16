@@ -292,6 +292,17 @@ def add_rl_args(p: ArgumentParser):
         type=float,
         help="Max L2 norm of the gradient vector, set to 0 to disable gradient clipping",
     )
+    p.add_argument(
+        "--use_amp",
+        default="fp32",
+        choices=["fp32", "bf16"],
+        type=str,
+        help=(
+            "Mixed precision for the learner's loss computation only (rollout inference stays fp32). "
+            "bf16 wraps the PPO forward/loss in torch.autocast; bf16 needs no gradient scaling. "
+            "Largest benefit for attention-heavy policies."
+        ),
+    )
 
     # learning rate
     p.add_argument("--learning_rate", default=1e-4, type=float, help="LR")
@@ -308,6 +319,17 @@ def add_rl_args(p: ArgumentParser):
         ),
     )
     p.add_argument("--lr_schedule_kl_threshold", default=0.008, type=float, help="Used with kl_adaptive_* schedulers")
+    p.add_argument(
+        "--lr_warmup_updates",
+        default=0,
+        type=int,
+        help=(
+            "Linear LR warmup over the first N learner updates (0 = off). Composes with any --lr_schedule: "
+            "during warmup the LR ramps 0 -> --learning_rate, afterwards the schedule (e.g. kl_adaptive) "
+            "takes over. Recommended for attention-based policies, which are unstable at full LR from the "
+            "very first update."
+        ),
+    )
     p.add_argument("--lr_adaptive_min", default=1e-6, type=float, help="Minimum learning rate")
     p.add_argument(
         "--lr_adaptive_max",
@@ -674,6 +696,12 @@ def add_eval_args(parser):
     parser.add_argument("--video_name", default=None, type=str, help="Name of video to save")
     parser.add_argument("--max_num_frames", default=1e9, type=int, help="Maximum number of frames for evaluation")
     parser.add_argument("--max_num_episodes", default=1e9, type=int, help="Maximum number of episodes for evaluation")
+    parser.add_argument(
+        "--verbose",
+        default=False,
+        type=str2bool,
+        help="Log one line per finished episode (agent, frames, reward). Parsed by eval sweep tooling.",
+    )
 
     parser.add_argument("--push_to_hub", action="store_true", help="Push experiment folder to HuggingFace Hub")
     parser.add_argument(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
 import time
@@ -100,17 +101,56 @@ class LinearDecayScheduler(LearningRateScheduler):
         return lr
 
 
+class WarmupScheduler(LearningRateScheduler):
+    """Linear 0 -> base LR ramp over the first N learner updates, then hands control to the
+    wrapped schedule (e.g. kl_adaptive).
+
+    update() runs AFTER each optimizer step, so the learner seeds curr_lr with first_step_lr()
+    at init to make the very first update already ramped; on checkpoint resume the learner
+    fast-forwards the ramp (self.step = warmup_updates) instead of re-warming a loaded policy.
+    """
+
+    def __init__(self, cfg: Config, inner: LearningRateScheduler):
+        self.warmup_updates: int = cfg.lr_warmup_updates
+        self.inner = inner
+        self.base_lr: float = cfg.learning_rate
+        self.step = 0
+
+    def first_step_lr(self) -> float:
+        return self.base_lr / self.warmup_updates
+
+    def _in_warmup(self) -> bool:
+        return self.step < self.warmup_updates
+
+    def invoke_after_each_minibatch(self):
+        # True during warmup so update() advances the ramp every minibatch;
+        # afterwards the inner schedule decides (it may prefer per-epoch cadence)
+        return self._in_warmup() or self.inner.invoke_after_each_minibatch()
+
+    def invoke_after_each_epoch(self):
+        return (not self._in_warmup()) and self.inner.invoke_after_each_epoch()
+
+    def update(self, current_lr, recent_kls):
+        self.step += 1
+        if self.step < self.warmup_updates:
+            return self.base_lr * (self.step + 1) / self.warmup_updates
+        return self.inner.update(current_lr, recent_kls)
+
+
 def get_lr_scheduler(cfg) -> LearningRateScheduler:
     if cfg.lr_schedule == "constant":
-        return LearningRateScheduler()
+        scheduler = LearningRateScheduler()
     elif cfg.lr_schedule == "kl_adaptive_minibatch":
-        return KlAdaptiveSchedulerPerMinibatch(cfg)
+        scheduler = KlAdaptiveSchedulerPerMinibatch(cfg)
     elif cfg.lr_schedule == "kl_adaptive_epoch":
-        return KlAdaptiveSchedulerPerEpoch(cfg)
+        scheduler = KlAdaptiveSchedulerPerEpoch(cfg)
     elif cfg.lr_schedule == "linear_decay":
-        return LinearDecayScheduler(cfg)
+        scheduler = LinearDecayScheduler(cfg)
     else:
         raise RuntimeError(f"Unknown scheduler {cfg.lr_schedule}")
+    if cfg.lr_warmup_updates > 0:
+        scheduler = WarmupScheduler(cfg, scheduler)
+    return scheduler
 
 
 def model_initialization_data(
@@ -205,6 +245,8 @@ class Learner(Configurable):
 
         # initialize device
         self.device = policy_device(self.cfg, self.policy_id)
+        # learner-only mixed precision (bf16): rollout/inference forwards stay fp32
+        self.amp_dtype: Optional[torch.dtype] = torch.bfloat16 if self.cfg.use_amp == "bf16" else None
 
         log.debug("Initializing actor-critic model on device %s", self.device)
 
@@ -247,7 +289,15 @@ class Learner(Configurable):
         self.policy_versions_tensor[self.policy_id] = self.train_step
 
         self.lr_scheduler = get_lr_scheduler(self.cfg)
-        self.curr_lr = self.cfg.learning_rate if self.curr_lr is None else self.curr_lr
+        if self.curr_lr is None:
+            self.curr_lr = self.cfg.learning_rate
+            if isinstance(self.lr_scheduler, WarmupScheduler):
+                # seed the ramp so the FIRST optimizer step is already warmed
+                # (scheduler.update() only runs after a step)
+                self.curr_lr = self.lr_scheduler.first_step_lr()
+        elif isinstance(self.lr_scheduler, WarmupScheduler):
+            # resumed from checkpoint: fast-forward the ramp, a loaded policy must not re-warm
+            self.lr_scheduler.step = self.lr_scheduler.warmup_updates
         self._apply_lr(self.curr_lr)
 
         self.is_initialized = True
@@ -534,6 +584,15 @@ class Learner(Configurable):
         mb = buffer[indices]
         return mb
 
+    def _amp_autocast(self):
+        """Autocast context for the learner's loss forward; nullcontext when AMP is off.
+
+        bf16 needs no GradScaler; gradients accumulate in fp32 master weights, so
+        loss.backward() stays OUTSIDE this context."""
+        if self.amp_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
+
     def _calculate_losses(
         self, mb: AttrDict, num_invalids: int
     ) -> Tuple[ActionDistribution, Tensor, Tensor | float, Optional[Tensor], Tensor | float, Tensor, Dict]:
@@ -722,7 +781,7 @@ class Learner(Configurable):
                     # enable syntactic sugar that allows us to access dict's keys as object attributes
                     mb = AttrDict(mb)
 
-                with timing.add_time("calculate_losses"):
+                with self._amp_autocast(), timing.add_time("calculate_losses"):
                     (
                         action_distribution,
                         policy_loss,
