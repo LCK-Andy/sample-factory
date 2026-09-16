@@ -99,6 +99,7 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
     The preset is resolved hydra-style with sys.argv swapped out (same trick as
     flash_rl's wrapper), so SF's own CLI args are invisible to hydra.
     """
+    import importlib
     import os
 
     # SF re-fires RolloutWorker.init (once per inference worker), calling the
@@ -142,6 +143,14 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
 
     import isaaclab_tasks  # noqa: F401  (task registration)
     from isaaclab_tasks.utils.hydra import resolve_task_config
+
+    # extra task packages (e.g. LEAP_Isaaclab.tasks) register their gym ids on import;
+    # IL_EXTRA_TASK_MODULES accepts a comma-separated list -- same transport flash_rl
+    # uses (FLASH_RL_EXTRA_TASK_MODULES), so a machine already running flash_rl tasks
+    # needs only the env var swap
+    for extra_module in filter(None, os.environ.get("IL_EXTRA_TASK_MODULES", "").split(",")):
+        importlib.import_module(extra_module)
+        print(f"[bridge] imported extra task module {extra_module}", flush=True)
 
     _argv = sys.argv
     sys.argv = [_argv[0], f"presets={physics}"]
@@ -285,6 +294,7 @@ def custom_env_override_defaults(cfg) -> None:
 def register_isaaclab_envs() -> None:
     register_env("Isaac-Ant-Direct-v0", make_isaaclab_env)
     register_env("Isaac-Repose-Cube-Allegro-Direct-v0", make_isaaclab_env)
+    register_env("Isaac-Repose-Cube-LEAP-Direct-v0", make_isaaclab_env)
     for env_id in (
         "Isaac-Dexsuite-Kuka-Allegro-Lift-v0",
         "Isaac-Dexsuite-Kuka-Allegro-Reorient-v0",
