@@ -100,6 +100,7 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
     flash_rl's wrapper), so SF's own CLI args are invisible to hydra.
     """
     import os
+
     # SF re-fires RolloutWorker.init (once per inference worker), calling the
     # factory twice in one process; Isaac Lab allows a single sim context per
     # process, so serve a per-process singleton instead of rebuilding.
@@ -117,7 +118,6 @@ def make_isaaclab_env(full_env_name: str, cfg=None, env_config=None, render_mode
         # app-first boot: PhysX needs the full Isaac Sim app running BEFORE any
         # task-package import that touches pxr (dual-USD crash otherwise)
         import isaacsim  # noqa: F401
-
         from isaaclab.app import AppLauncher
 
         # Kit sizes its tasking pool from os.cpu_count(), which reports the HOST
@@ -241,9 +241,7 @@ def add_extra_params_func(parser: argparse.ArgumentParser) -> None:
     )
     p.add_argument("--il_tr_d_model", default=256, type=int, help="transformer trunk width")
     p.add_argument("--il_tr_layers", default=2, type=int, help="transformer encoder layers")
-    p.add_argument(
-        "--il_tr_heads", default=4, type=int, help="transformer attention heads (must divide il_tr_d_model)"
-    )
+    p.add_argument("--il_tr_heads", default=4, type=int, help="transformer attention heads (must divide il_tr_d_model)")
 
 
 def custom_env_override_defaults(cfg) -> None:
@@ -251,8 +249,12 @@ def custom_env_override_defaults(cfg) -> None:
     add_extra_params_func via parser.set_defaults -- see the note there).
 
     NOTE: runs AFTER CLI parsing, so anything set here trumps command-line flags.
-    Only Ant-specific hyperparameters are pinned for the Ant env; dexsuite keeps
-    CLI values so the recipe can be tuned per run."""
+    Hyperparameter pins are scoped strictly to the env they were matched for
+    (Ant recipe, dexsuite sizing); every other env keeps CLI values -- an
+    earlier version let the Ant lr/encoder pins fall through onto ALL tasks,
+    which silently gave e.g. Repose-Cube MLP arms lr=3e-4 while custom-model
+    arms fell through to SF's default 1e-4, confounding architecture
+    comparisons run with "identical" flags."""
     if getattr(cfg, "il_model", "default") in ("flashsac", "flashsac_shared"):
         from sf_examples.isaac_lab_examples.flashsac_model import register_flashsac_model
 
@@ -272,10 +274,12 @@ def custom_env_override_defaults(cfg) -> None:
     if "Dexsuite" in cfg.env:
         # match the task's rsl_rl cfg sizing ([512, 256, 128], elu)
         cfg.encoder_mlp_layers = [512, 256, 128]
-    else:
-        cfg.encoder_mlp_layers = [400, 200, 100]  # match the rsl-rl baseline sizing
+    elif "Ant" in cfg.env:
+        # Ant-only recipe (matched the rsl-rl IsaacGym baseline sizing)
+        cfg.encoder_mlp_layers = [400, 200, 100]
         cfg.learning_rate = 3e-4
         cfg.adam_eps = 1e-5
+    # everything else: no implicit pins, CLI values stand
 
 
 def register_isaaclab_envs() -> None:
