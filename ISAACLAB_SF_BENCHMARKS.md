@@ -79,3 +79,53 @@ python -m sf_examples.isaac_lab_examples.train_isaaclab \
 - SF runs: `~/Documents/projects/sample-factory/train_dir/il-ant-2m{,-tuned}/`, `il-ant-20m-tuned/`, `il-ant-20m-2048/` (best ckpt `checkpoint_p0/best_*.pt`; TB in `.summary/0`)
 - rsl_rl runs: `~/IsaacLab/logs/rsl_rl/ant_direct/2026-09-14_0*` (playable `model_*.pt`)
 - Clone commits: `2060b57` (integration + 2 core fixes), `060f5cc` (PhysX), `1f4d488` (set_defaults + config-cache note)
+
+---
+
+# Architecture comparison v2 — clean re-run (2026-09-16)
+
+**Task:** `Isaac-Repose-Cube-Allegro-Direct-v0` · 512 envs · Newton · 10M steps · 3 seeds · lr 3e-4 (all arms, Stage-A-screened) · warmup 200 updates · bf16 AMP (learner) · ELU + [512,256,128] on default-model arms · TR = RoPE causal transformer, K=16.
+
+## Why v2 exists: the v1 architecture comparison was confounded
+
+The bridge's Ant-recipe pin (`lr=3e-4`, encoder `[400,200,100]`) leaked onto **all** non-Dexsuite default-model envs, while custom-model arms (`return` early) fell through to SF's default `1e-4`. So v1's MLP/GRU arms (best 2.14/2.29) ran 3× the LR of the transformer arm (best 6.64) despite the script's "identical flags" claim. The pin is now scoped Ant-only (`custom_env_override_defaults`); v2 pins every arm's LR/sizing on its own command line (`run_allegro_compare.sh`).
+
+## Headline results
+
+**Training best-checkpoint reward (scaled units, max over episodes — noisy):**
+
+| arch | s0 | s1 | s2 | mean |
+|---|---|---|---|---|
+| MLP | 1.32 | 1.75 | 1.04 | **1.37** |
+| GRU | 1.52 | 1.56 | 0.08 | **1.05** |
+| **Transformer (RoPE, K=16)** | **9.22** | **9.10** | **8.98** | **9.10** |
+
+**Deterministic eval (per-episode reward, raw env scale, mean ± std over ≥130k episodes, best ckpt):**
+
+| arch | s0 | s1 | s2 | mean |
+|---|---|---|---|---|
+| MLP | 11.96 ± 57.6 | −0.04 ± 46.5 | 16.59 ± 63.8 | **~9.5** (huge seed spread) |
+| GRU | −1.13 ± 36.1 | −3.67 ± 26.9 | −1.03 ± 38.8 | **~−1.9** |
+| **Transformer** | **18.66 ± 63.3** | **24.67 ± 70.3** | **21.34 ± 67.0** | **~21.6** |
+
+best vs latest checkpoints agree everywhere (endpoints are stable). **The transformer wins decisively and consistently: ~2× MLP, GRU never leaves negative territory — and its seed variance is the smallest of the three.** v1's "transformer wins" finding replicates *stronger* at matched LR.
+
+Throughput (10M, s0): MLP 22.6k · GRU 19.1k · TR 14.6k steps/s — TR pays ~24% vs MLP, keeps 1.5× headroom over the v1 10.9k (RoPE trunk + bf16).
+
+## Findings beyond the ranking
+
+1. **Warmup unlocks 3e-4 for the transformer** (Stage A, 2M): TR at 1e-4 → −0.63; at 3e-4 → 2.53. All three archs selected 3e-4, so the decisive runs are uniform-LR — seeds carry the statistics.
+2. **Best-checkpoint reward mis-ranks arms.** GRU's training peaks (1.5/1.6/0.08) suggested 2nd place; deterministic eval puts GRU last (~−2 everywhere). Its rare success episodes don't transfer to eval. The eval sweep is the headline metric from now on.
+3. **K-sweep (2M, best-reward): K=8 → 0.66, K=16 → 1.91, K=32 → 0.64.** Non-monotone with a peak at 16: no evidence longer context helps on this task family. **Direction B (native in-SF sequence transformer core) shelved** — the stateless frame-stack + RoPE design is the right endpoint here.
+4. **Caveats:** eval episode counts differ ~5× across arms (GRU 767k vs TR 134k in the same frame budget) — GRU's episodes are much shorter, which flatters its per-episode sums slightly; and same-seed 2M reruns vary ±0.6 best-reward (v2-tr-2m 2.53 vs k-sweep k16 1.91, identical config), so single 2M numbers are screens, not results.
+
+## Reproduce
+
+```bash
+./run_allegro_compare.sh stage-a                          # LR screen (6 × 2M)
+./run_allegro_compare.sh stage-b mlp:3e-4 gru:3e-4 tr:3e-4  # 10M × 3 seeds
+./run_allegro_compare.sh stage-c <experiment names>       # deterministic eval sweep
+./run_allegro_compare.sh k-sweep tr:3e-4                  # K ∈ {8,16,32}
+```
+
+New SF flags this round: `--lr_warmup_updates`, `--use_amp=bf16` (learner-only), `--verbose` (per-episode eval lines). Transformer trunk now RoPE (policy weights transfer across K; only obs-normalizer stats are K-shaped). Unit tests: `tests/test_transformer_model.py`.
